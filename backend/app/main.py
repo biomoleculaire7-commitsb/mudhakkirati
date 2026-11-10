@@ -74,6 +74,11 @@ def health():
     return {"ok": True, "ai": bool(generator._api_key()), "model": generator.LLM_MODEL}
 
 
+@app.get("/api/llm-check")
+async def llm_check():
+    return await generator.check_llm()
+
+
 @app.get("/api/curriculum")
 def get_curriculum():
     return curriculum.summary()
