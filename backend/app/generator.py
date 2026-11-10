@@ -1,5 +1,7 @@
 """Lesson-plan (مذكرة) generation: LLM (OpenAI-compatible, Groq by default) with an offline template fallback."""
+import asyncio
 import json
+import logging
 import os
 import re
 
@@ -9,6 +11,9 @@ from . import curriculum
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8000"))
+log = logging.getLogger("mudhakkira.llm")
+logging.basicConfig(level=logging.INFO)
 
 
 def _api_key() -> str | None:
@@ -108,25 +113,84 @@ def _extract_json(text: str) -> dict:
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise ValueError("no JSON in model output")
-    return json.loads(m.group(0))
+    return json.loads(m.group(0), strict=False)  # tolerate raw newlines inside Arabic strings
+
+
+class LLMError(Exception):
+    pass
+
+
+def _explain(status: int, text: str) -> str:
+    """Short Arabic explanation of an API error, kept with the raw detail for debugging."""
+    detail = text[:300]
+    if status == 401:
+        return f"مفتاح API غير صالح أو ملغى (401). أنشئ مفتاحاً جديداً. التفاصيل: {detail}"
+    if status == 429:
+        return f"تجاوزت حد الطلبات المسموح به مؤقتاً (429). انتظر دقيقة ثم أعد المحاولة. التفاصيل: {detail}"
+    if status == 413:
+        return f"الطلب أطول من الحد المسموح به لهذا النموذج (413). التفاصيل: {detail}"
+    return f"خطأ من خدمة الذكاء الاصطناعي ({status}). التفاصيل: {detail}"
+
+
+async def _post(client: httpx.AsyncClient, body: dict) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
+    for attempt in range(3):
+        r = await client.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=body)
+        if r.status_code != 429 or attempt == 2:
+            return r
+        # rate limited: wait as told by the API (bounded), then retry
+        try:
+            wait = float(r.headers.get("retry-after", "8"))
+        except ValueError:
+            wait = 8.0
+        await asyncio.sleep(min(max(wait, 2.0), 20.0))
+    return r
 
 
 async def _call_llm(prompt: str) -> dict:
-    headers = {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
-    body = {
+    base = {
         "model": LLM_MODEL,
         "temperature": 0.5,
-        "max_tokens": 4096,
-        "response_format": {"type": "json_object"},
+        "max_tokens": LLM_MAX_TOKENS,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=body)
-        r.raise_for_status()
-        return _extract_json(r.json()["choices"][0]["message"]["content"])
+    async with httpx.AsyncClient(timeout=120) as client:
+        # 1st try: strict JSON mode. If the provider rejects the output (e.g. long Arabic text cut off ->
+        # json_validate_failed), retry once in plain mode and parse the JSON ourselves.
+        r = await _post(client, {**base, "response_format": {"type": "json_object"}})
+        if r.status_code == 400 and ("json" in r.text.lower() or "validate" in r.text.lower()):
+            log.warning("JSON mode rejected, retrying without response_format: %s", r.text[:300])
+            r = await _post(client, base)
+        if r.status_code >= 400:
+            log.error("LLM HTTP %s: %s", r.status_code, r.text[:500])
+            raise LLMError(_explain(r.status_code, r.text))
+        choice = r.json()["choices"][0]
+        content = choice["message"]["content"] or ""
+        try:
+            return _extract_json(content)
+        except (ValueError, json.JSONDecodeError) as exc:
+            log.error("Unparseable LLM output (finish_reason=%s): %s", choice.get("finish_reason"), content[:500])
+            if choice.get("finish_reason") == "length":
+                raise LLMError("انقطع رد النموذج لطوله قبل اكتمال المذكرة. أعد المحاولة أو اختصر التوجيهات.") from exc
+            raise LLMError("ردّ النموذج بصيغة غير صالحة. أعد المحاولة.") from exc
+
+
+async def check_llm() -> dict:
+    """Tiny real request to the provider, to diagnose deployment problems from the browser."""
+    if not _api_key():
+        return {"ok": False, "error": "لا يوجد مفتاح GROQ_API_KEY في متغيرات البيئة."}
+    body = {"model": LLM_MODEL, "max_tokens": 5, "messages": [{"role": "user", "content": "قل: نعم"}]}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await _post(client, body)
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "error": _explain(r.status_code, r.text)}
+        return {"ok": True, "model": LLM_MODEL, "reply": r.json()["choices"][0]["message"]["content"]}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
 
 
 def _fallback(req: dict, subject: dict) -> dict:
@@ -214,9 +278,13 @@ async def generate(req: dict) -> dict:
         try:
             content = await _call_llm(build_prompt(req, subject, level))
             source = "ai"
-        except Exception as exc:  # network/quota/parse → fall back, but tell the UI
+        except LLMError as exc:
             content = None
-            req["_error"] = str(exc)[:200]
+            req["_error"] = str(exc)
+        except Exception as exc:  # network errors etc. → fall back, but tell the UI
+            log.exception("LLM call failed")
+            content = None
+            req["_error"] = f"تعذر الاتصال بخدمة الذكاء الاصطناعي: {type(exc).__name__}: {str(exc)[:200]}"
     if content is None:
         content = _fallback(req, subject)
         off, _, _ = find_official(subject, level["id"], req["sequence"], req["lesson"])
